@@ -35,7 +35,6 @@ def _read_string(text: str, start: int) -> Tuple[str, int]:
             escaped = text[index + 1]
             if escaped not in _ESCAPABLE:
                 raise ValueError("invalid-escape")
-            chars.append(char)
             chars.append(escaped)
             index += 2
             continue
@@ -88,7 +87,7 @@ def tokenize(text: str) -> List[Token]:
         elif lowered == "null":
             tokens.append(("null", lowered))
         else:
-            tokens.append(("path", lowered))
+            tokens.append(("path", word))
     return tokens
 
 
@@ -123,19 +122,24 @@ def parse(text: str) -> Node:
 
 
 def _parse_or(tokens: Sequence[Token], position: int) -> Tuple[Node, int]:
+    node, position = _parse_and(tokens, position)
+    while _peek(tokens, position) == ("op", "or"):
+        right, position = _parse_and(tokens, position + 1)
+        node = ("or", node, right)
+    return node, position
+
+
+def _parse_and(tokens: Sequence[Token], position: int) -> Tuple[Node, int]:
     node, position = _parse_unary(tokens, position)
-    while True:
-        token = _peek(tokens, position)
-        if token is None or token[0] != "op" or token[1] not in ("and", "or"):
-            break
+    while _peek(tokens, position) == ("op", "and"):
         right, position = _parse_unary(tokens, position + 1)
-        node = (token[1], node, right)
+        node = ("and", node, right)
     return node, position
 
 
 def _parse_unary(tokens: Sequence[Token], position: int) -> Tuple[Node, int]:
     if _peek(tokens, position) == ("op", "not"):
-        node, position = _parse_or(tokens, position + 1)
+        node, position = _parse_unary(tokens, position + 1)
         return ("not", node), position
     return _parse_primary(tokens, position)
 
@@ -183,7 +187,9 @@ def _render(node: Node, parent: int) -> str:
     if kind == "not":
         return "not " + _render(node[1], 3)
     precedence = 1 if kind == "or" else 2
-    text = _render(node[1], precedence) + " " + kind + " " + _render(node[2], precedence)
+    left = _render(node[1], precedence)
+    right = _render(node[2], precedence + 1)
+    text = left + " " + kind + " " + right
     if precedence < parent:
         return "(" + text + ")"
     return text
@@ -239,8 +245,14 @@ def _equal(value: Any, literal: Any) -> bool:
 
 
 def _order(op: str, value: Any, literal: Any) -> bool:
-    left: Any = str(value)
-    right: Any = str(literal)
+    if _is_number(value) and _is_number(literal):
+        left: Any = float(value)
+        right: Any = float(literal)
+    elif isinstance(value, str) and isinstance(literal, str):
+        left = value.lower()
+        right = literal.lower()
+    else:
+        return False
     if op == "gt":
         return left > right
     if op == "ge":
@@ -260,11 +272,13 @@ def _compare(op: str, value: Any, literal: Any) -> bool:
     if op in ("co", "sw", "ew"):
         if not isinstance(value, str) or not isinstance(literal, str):
             return False
+        left = value.lower()
+        right = literal.lower()
         if op == "co":
-            return literal in value
+            return right in left
         if op == "sw":
-            return value.startswith(literal)
-        return value.endswith(literal)
+            return left.startswith(right)
+        return left.endswith(right)
     if op in ("gt", "ge", "lt", "le"):
         return _order(op, value, literal)
     return False
@@ -281,7 +295,9 @@ def _evaluate_node(node: Node, resource: Mapping[str, Any]) -> bool:
     _tag, path, op, literal = node
     present, value = _lookup(resource, path)
     if op == "pr":
-        return present and bool(value)
+        return present and value is not None
+    if not present:
+        return False
     return _compare(op, value, literal)
 
 
@@ -300,7 +316,7 @@ def _sql(node: Node) -> Tuple[str, List[Any]]:
         left_sql, left_params = _sql(node[1])
         right_sql, right_params = _sql(node[2])
         joiner = " AND " if kind == "and" else " OR "
-        return "(" + left_sql + joiner + right_sql + ")", right_params + left_params
+        return "(" + left_sql + joiner + right_sql + ")", left_params + right_params
     if kind == "not":
         inner_sql, inner_params = _sql(node[1])
         return "NOT (" + inner_sql + ")", inner_params
@@ -339,7 +355,7 @@ def validate(text: str) -> List[str]:
             if char == "\\":
                 if index + 1 >= len(text):
                     problems.append("unterminated-string")
-                    break
+                    return problems
                 if text[index + 1] not in _ESCAPABLE:
                     problems.append("invalid-escape")
                 index += 2
@@ -360,4 +376,6 @@ def validate(text: str) -> List[str]:
         index += 1
     if in_string:
         problems.append("unterminated-string")
+    if depth > 0:
+        problems.append("unbalanced-paren")
     return problems
